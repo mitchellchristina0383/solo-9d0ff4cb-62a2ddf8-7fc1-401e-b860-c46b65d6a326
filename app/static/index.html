@@ -1,0 +1,215 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>供水账户用量明细服务</title>
+<style>
+  :root { --border:#d0d7de; --muted:#656d76; --blue:#0969da; --green:#1a7f37; --red:#cf222e; --amber:#9a6700; }
+  * { box-sizing: border-box; }
+  body { margin:0; font-family: -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif; color:#1f2328; background:#f6f8fa; }
+  header { background:#0d3b66; color:#fff; padding:18px 28px; }
+  header h1 { margin:0; font-size:20px; }
+  header p { margin:6px 0 0; opacity:.85; font-size:13px; }
+  main { max-width:1080px; margin:24px auto; padding:0 20px; display:grid; gap:20px; }
+  .card { background:#fff; border:1px solid var(--border); border-radius:10px; padding:20px; }
+  .card h2 { margin:0 0 12px; font-size:16px; }
+  .hint { color:var(--muted); font-size:12.5px; line-height:1.6; margin:8px 0; }
+  code { background:#eff1f3; padding:1px 5px; border-radius:4px; font-size:12px; }
+  .row { display:flex; gap:12px; flex-wrap:wrap; align-items:center; }
+  button { border:1px solid var(--border); background:#f6f8fa; border-radius:6px; padding:8px 16px; cursor:pointer; font-size:14px; }
+  button.primary { background:var(--blue); color:#fff; border-color:var(--blue); }
+  button:disabled { opacity:.5; cursor:not-allowed; }
+  table { border-collapse:collapse; width:100%; font-size:12.5px; }
+  th, td { border:1px solid var(--border); padding:6px 8px; text-align:left; vertical-align:top; }
+  th { background:#f6f8fa; }
+  .badge { display:inline-block; padding:2px 8px; border-radius:999px; font-size:11.5px; font-weight:600; }
+  .badge.active { background:#dafbe1; color:var(--green); }
+  .badge.expired { background:#fff8c5; color:var(--amber); }
+  .badge.failed { background:#ffebe9; color:var(--red); }
+  .badge.committed { background:#dafbe1; color:var(--green); }
+  .badge.rejected { background:#ffebe9; color:var(--red); }
+  .badge.OK { background:#dafbe1; color:var(--green); }
+  .badge.REVIEW { background:#fff8c5; color:var(--amber); }
+  #toast { position:fixed; right:20px; bottom:20px; max-width:420px; display:grid; gap:8px; z-index:10; }
+  .toast { padding:12px 16px; border-radius:8px; color:#fff; font-size:13px; box-shadow:0 4px 12px rgba(0,0,0,.15); }
+  .toast.ok { background:var(--green); }
+  .toast.err { background:var(--red); }
+  .grid2 { display:grid; grid-template-columns:1fr 1fr; gap:20px; }
+  @media (max-width: 820px) { .grid2 { grid-template-columns:1fr; } }
+  .scroll { overflow-x:auto; max-height:420px; overflow-y:auto; }
+  a.dl { color:var(--blue); text-decoration:none; font-size:12.5px; }
+  .detail { color:var(--muted); font-size:11.5px; margin-top:4px; word-break:break-all; }
+</style>
+</head>
+<body>
+<header>
+  <h1>供水账户用量明细服务</h1>
+  <p>读数 / 换表 CSV 上传 · 区间用量生成 · 待核标注 · 结果下载（全部时刻按 UTC 处理）</p>
+</header>
+<main>
+  <section class="card grid2">
+    <div>
+      <h2>① 增量上传：累计读数 CSV</h2>
+      <p class="hint">表头：<code>account,meter,read_at,reading_cum</code><br>
+        同表同时同值重传自动只计一次；异值整批拒收（HTTP 422）。</p>
+      <div class="row">
+        <input type="file" id="readingFile" accept=".csv,text/csv">
+        <button class="primary" onclick="upload('reading')">上传读数</button>
+      </div>
+    </div>
+    <div>
+      <h2>② 整版上传：换表 CSV（每户一条）</h2>
+      <p class="hint">表头：<code>account,old_meter,new_meter,switched_at</code><br>
+        整版替换：新文件提交后旧换表数据整体失效，并使旧结果过期。</p>
+      <div class="row">
+        <input type="file" id="replacementFile" accept=".csv,text/csv">
+        <button class="primary" onclick="upload('replacement')">上传换表</button>
+      </div>
+    </div>
+  </section>
+
+  <section class="card">
+    <h2>③ 生成现役结果</h2>
+    <p class="hint">仅基于当前已提交的全部输入完整生成；与上传交错时，生成期间新提交的输入不会被半包纳入。
+      生成失败时不发布新结果，上一版结果仍可下载并标记为过期。</p>
+    <div class="row">
+      <button class="primary" onclick="generate()">生成新一代结果</button>
+      <button onclick="loadAll()">刷新</button>
+    </div>
+  </section>
+
+  <section class="card">
+    <h2>结果代际</h2>
+    <div class="scroll">
+      <table id="genTable">
+        <thead><tr>
+          <th>代际</th><th>状态</th><th>生成时间 (UTC)</th><th>行数</th><th>待核</th>
+          <th>读数批次</th><th>换表批次</th><th>说明</th><th>下载</th>
+        </tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="card">
+    <h2>最新一代明细预览（前 200 行）</h2>
+    <div class="scroll">
+      <table id="rowsTable">
+        <thead><tr>
+          <th>账户</th><th>表号</th><th>区间起 (UTC)</th><th>区间止 (UTC)</th>
+          <th>起读数</th><th>止读数</th><th>用量 m³</th><th>归属 UTC 日</th>
+          <th>状态</th><th>待核原因</th><th>来源读数 ID</th>
+        </tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="card">
+    <h2>上传批次记录（含拒收审计）</h2>
+    <div class="scroll">
+      <table id="batchTable">
+        <thead><tr>
+          <th>批次</th><th>类型</th><th>文件</th><th>状态</th><th>行数</th><th>时间 (UTC)</th><th>拒收原因</th>
+        </tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </section>
+</main>
+<div id="toast"></div>
+
+<script>
+function toast(msg, ok=true) {
+  const box = document.getElementById('toast');
+  const el = document.createElement('div');
+  el.className = 'toast ' + (ok ? 'ok' : 'err');
+  el.textContent = msg;
+  box.appendChild(el);
+  setTimeout(() => el.remove(), 6000);
+}
+
+async function upload(kind) {
+  const input = document.getElementById(kind === 'reading' ? 'readingFile' : 'replacementFile');
+  if (!input.files.length) { toast('请先选择 CSV 文件', false); return; }
+  const fd = new FormData();
+  fd.append('file', input.files[0]);
+  const url = kind === 'reading' ? '/api/uploads/readings' : '/api/uploads/replacements';
+  try {
+    const resp = await fetch(url, { method: 'POST', body: fd });
+    const data = await resp.json();
+    if (!resp.ok) throw new Error(data.detail || ('HTTP ' + resp.status));
+    toast(data.message);
+  } catch (e) {
+    toast('上传被拒收：' + e.message, false);
+  }
+  loadAll();
+}
+
+async function generate() {
+  try {
+    const resp = await fetch('/api/generations', { method: 'POST' });
+    const data = await resp.json();
+    if (!resp.ok) throw new Error(data.detail || ('HTTP ' + resp.status));
+    toast(data.message);
+  } catch (e) {
+    toast('生成失败（旧结果保留并标过期）：' + e.message, false);
+  }
+  loadAll();
+}
+
+function esc(v) {
+  return String(v ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+}
+
+async function loadAll() {
+  const [gResp, bResp] = await Promise.all([
+    fetch('/api/generations'), fetch('/api/batches')]);
+  const gens = (await gResp.json()).generations;
+  const batches = (await bResp.json()).batches;
+
+  document.querySelector('#genTable tbody').innerHTML = gens.map(g => `
+    <tr>
+      <td>${g.id}</td>
+      <td><span class="badge ${g.status}">${g.status}</span></td>
+      <td>${esc(g.created_at)}</td>
+      <td>${g.row_count}</td>
+      <td>${g.review_count}</td>
+      <td>${esc(g.reading_batch_ids)}</td>
+      <td>${esc(g.replacement_batch_id ?? '')}</td>
+      <td>${esc(g.status_detail ?? '')}</td>
+      <td><a class="dl" href="/api/generations/${g.id}/download">下载 CSV</a></td>
+    </tr>`).join('') || '<tr><td colspan="9" style="color:#656d76">尚无结果代际</td></tr>';
+
+  document.querySelector('#batchTable tbody').innerHTML = batches.map(b => `
+    <tr>
+      <td>${b.id}</td><td>${b.batch_type}</td><td>${esc(b.filename)}</td>
+      <td><span class="badge ${b.status}">${b.status}</span></td>
+      <td>${b.row_count}</td><td>${esc(b.created_at)}</td>
+      <td>${esc(b.reject_reason ?? '')}</td>
+    </tr>`).join('') || '<tr><td colspan="7" style="color:#656d76">尚无上传批次</td></tr>';
+
+  const latest = gens[0];
+  const rowsBody = document.querySelector('#rowsTable tbody');
+  if (!latest) {
+    rowsBody.innerHTML = '<tr><td colspan="11" style="color:#656d76">尚无结果</td></tr>';
+    return;
+  }
+  const rResp = await fetch(`/api/generations/${latest.id}/rows?limit=200`);
+  const data = await rResp.json();
+  rowsBody.innerHTML = data.rows.map(r => `
+    <tr>
+      <td>${esc(r.account)}</td><td>${esc(r.meter)}</td>
+      <td>${esc(r.interval_start ?? '')}</td><td>${esc(r.interval_end ?? '')}</td>
+      <td>${esc(r.start_reading ?? '')}</td><td>${esc(r.end_reading ?? '')}</td>
+      <td>${esc(r.consumption_m3 ?? '')}</td><td>${esc(r.attributed_day ?? '')}</td>
+      <td><span class="badge ${r.status}">${r.status}</span></td>
+      <td>${esc(r.review_reason_detail ?? '')}</td>
+      <td>${esc(r.source_reading_ids)}</td>
+    </tr>`).join('');
+}
+loadAll();
+</script>
+</body>
+</html>
